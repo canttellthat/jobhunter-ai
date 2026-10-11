@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
+
 const defaults = [
   "stripe",
   "anthropic",
@@ -13,7 +14,31 @@ const defaults = [
   "scaleai",
   "snowflake",
   "wayfair",
+  "openai",
+  "databricks",
+  "figma",
+  "glean",
+  "huggingface",
+  "instacart",
+  "pinterest",
+  "reddit",
+  "roblox",
+  "samsara",
+  "coinbase",
+  "cloudflare",
+  "brex",
+  "plaid",
+  "grammarly",
+  "chime",
+  "airtable",
+  "anduril",
+  "gitlab",
+  "hubspot",
+  "mongodb",
+  "confluent",
+  "clickhouse",
 ];
+
 
 function plain(s = "") {
   return s
@@ -49,7 +74,7 @@ export async function POST(req: Request) {
     )
       .map((x: unknown) => String(x).trim())
       .filter((x: string) => /^[a-zA-Z0-9_-]{1,60}$/.test(x))
-      .slice(0, 25);
+      .slice(0, 40);
 
     const settled = await Promise.allSettled(
       [...new Set(boards)].map(async (board: string) => {
