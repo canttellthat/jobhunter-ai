@@ -44,7 +44,67 @@ const labels: Record<string, string> = {
   cloudflare: "Cloudflare",
 };
 
-async function getGreenhouseJobs(boards: string[]) {
+type Job = {
+  id: string;
+  company: string;
+  title: string;
+  location: string;
+  url: string;
+  description: string;
+  source: string;
+  created?: string;
+  salaryMin?: number | null;
+  salaryMax?: number | null;
+};
+
+function isUSJob(job: Job) {
+  const location = (job.location || "").toLowerCase();
+
+  // Explicit US locations or remote roles open to US applicants.
+  const usPatterns = [
+    /\b(united states|usa|u\.s\.a\.|u\.s\.)\b/,
+    /\bremote\b.*\b(us|usa|united states|north america)\b/,
+    /\b(us|usa|united states)\b.*\bremote\b/,
+    /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|district of columbia|washington,? dc)\b/,
+  ];
+
+  // Reject known non-US locations first.
+  const nonUS = [
+    /\b(mexico|united kingdom|england|london|scotland|wales|ireland|canada|india|nepal|australia|new zealand|germany|france|spain|italy|netherlands|singapore|philippines|brazil|argentina|poland|portugal|switzerland|sweden|norway|denmark|israel|japan|china)\b/,
+  ];
+
+  if (nonUS.some((pattern) => pattern.test(location))) {
+    // A job explicitly saying US remote can still be eligible.
+    if (!/\b(remote)\b.*\b(us|usa|united states)\b|\b(us|usa|united states)\b.*\bremote\b/.test(location)) {
+      return false;
+    }
+  }
+
+  return usPatterns.some((pattern) => pattern.test(location));
+}
+
+function deduplicate(jobs: Job[]) {
+  const seen = new Set<string>();
+
+  return jobs.filter((job) => {
+    const url = (job.url || "")
+      .toLowerCase()
+      .split("?")[0]
+      .replace(/\/+$/, "");
+
+    const identity = [
+      job.company.toLowerCase().replace(/[^a-z0-9]/g, ""),
+      job.title.toLowerCase().replace(/[^a-z0-9]/g, ""),
+      url,
+    ].join("|");
+
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+async function getGreenhouseJobs(boards: string[]): Promise<Job[]> {
   const results = await Promise.allSettled(
     [...new Set(boards)].map(async (board) => {
       const response = await fetch(
@@ -64,6 +124,7 @@ async function getGreenhouseJobs(boards: string[]) {
         url: job.absolute_url || "",
         description: plain(job.content || "").slice(0, 7000),
         source: "Greenhouse",
+        // Greenhouse's public board response may not provide a posting date.
       }));
     })
   );
@@ -73,7 +134,7 @@ async function getGreenhouseJobs(boards: string[]) {
   );
 }
 
-async function getAdzunaJobs(query: string, page: number) {
+async function getAdzunaJobs(query: string, page: number): Promise<Job[]> {
   const appId = process.env.ADZUNA_APP_ID;
   const appKey = process.env.ADZUNA_APP_KEY;
 
@@ -87,6 +148,7 @@ async function getAdzunaJobs(query: string, page: number) {
     where: "United States",
     "content-type": "application/json",
     sort_by: "date",
+    max_days_old: "7",
   });
 
   const response = await fetch(
@@ -105,10 +167,11 @@ async function getAdzunaJobs(query: string, page: number) {
     id: `adzuna:${job.id}`,
     company: job.company?.display_name || "Company not provided",
     title: job.title || "Untitled role",
-    location: job.location?.display_name || "United States",
+    location: job.location?.display_name || "",
     url: job.redirect_url || "",
     description: plain(job.description || "").slice(0, 7000),
     source: "Adzuna",
+    created: job.created || undefined,
     salaryMin: job.salary_min ?? null,
     salaryMax: job.salary_max ?? null,
   }));
@@ -141,17 +204,38 @@ export async function POST(req: Request) {
       }),
     ]);
 
-    const jobs = Array.from(
-      new Map(
-        [...greenhouse, ...adzuna].map((job: any) => [job.id, job])
-      ).values()
-    );
+    const combined = [...greenhouse, ...adzuna];
+
+    const filtered = combined.filter((job) => {
+      if (!job.location || job.location === "Location not provided") {
+        return false;
+      }
+
+      if (!isUSJob(job)) return false;
+
+      if (job.source === "Adzuna" && job.created) {
+        const posted = new Date(job.created).getTime();
+        const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+        if (!Number.isFinite(posted) || posted < sevenDaysAgo) {
+          return false;
+        }
+      }
+
+      return Boolean(job.url);
+    });
+
+    const jobs = deduplicate(filtered).sort((a, b) => {
+      const aDate = a.created ? new Date(a.created).getTime() : 0;
+      const bDate = b.created ? new Date(b.created).getTime() : 0;
+      return bDate - aDate;
+    });
 
     return NextResponse.json({
       jobs,
       warning: jobs.length
-        ? undefined
-        : "No listings returned. Check API credentials, internet connection, and search settings.",
+        ? `Showing ${jobs.length} unique US listings. Adzuna listings are limited to the last 7 days; Greenhouse posting dates may be unavailable.`
+        : "No matching US listings found. Try another keyword or check the company boards.",
     });
   } catch (error) {
     console.error("Job search failed:", error);
