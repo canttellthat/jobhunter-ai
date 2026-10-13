@@ -2,6 +2,7 @@
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 const defaults = [
   "stripe", "anthropic", "datadog", "doordash", "ramp",
@@ -12,19 +13,6 @@ const defaults = [
   "airtable", "anduril", "gitlab", "hubspot", "mongodb",
   "confluent", "clickhouse",
 ];
-
-function plain(s = "") {
-  return s
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 const labels: Record<string, string> = {
   stripe: "Stripe",
@@ -57,48 +45,66 @@ type Job = {
   salaryMax?: number | null;
 };
 
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function plain(s = "") {
+  return s
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isRecent(job: Job) {
+  if (!job.created) return false;
+
+  const timestamp = new Date(job.created).getTime();
+
+  return (
+    Number.isFinite(timestamp) &&
+    timestamp <= Date.now() &&
+    timestamp >= Date.now() - SEVEN_DAYS_MS
+  );
+}
+
 function isUSJob(job: Job) {
   const location = (job.location || "").toLowerCase();
 
-  // Explicit US locations or remote roles open to US applicants.
-  const usPatterns = [
-    /\b(united states|usa|u\.s\.a\.|u\.s\.)\b/,
-    /\bremote\b.*\b(us|usa|united states|north america)\b/,
-    /\b(us|usa|united states)\b.*\bremote\b/,
-    /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|district of columbia|washington,? dc)\b/,
-  ];
+  const explicitUSRemote =
+    /\b(remote)\b.*\b(us|usa|united states|u\.s\.)\b/.test(location) ||
+    /\b(us|usa|united states|u\.s\.)\b.*\bremote\b/.test(location);
 
-  // Reject known non-US locations first.
-  const nonUS = [
-    /\b(mexico|united kingdom|england|london|scotland|wales|ireland|canada|india|nepal|australia|new zealand|germany|france|spain|italy|netherlands|singapore|philippines|brazil|argentina|poland|portugal|switzerland|sweden|norway|denmark|israel|japan|china)\b/,
-  ];
+  const nonUS =
+    /\b(mexico|united kingdom|england|london|scotland|wales|ireland|canada|india|nepal|australia|new zealand|germany|france|spain|italy|netherlands|singapore|philippines|brazil|argentina|poland|portugal|switzerland|sweden|norway|denmark|israel|japan|china)\b/;
 
-  if (nonUS.some((pattern) => pattern.test(location))) {
-    // A job explicitly saying US remote can still be eligible.
-    if (!/\b(remote)\b.*\b(us|usa|united states)\b|\b(us|usa|united states)\b.*\bremote\b/.test(location)) {
-      return false;
-    }
+  if (nonUS.test(location) && !explicitUSRemote) {
+    return false;
   }
 
-  return usPatterns.some((pattern) => pattern.test(location));
+  const usLocation =
+    /\b(united states|usa|u\.s\.a\.|u\.s\.)\b/.test(location) ||
+    /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|district of columbia|washington,? dc)\b/.test(location);
+
+  return usLocation || explicitUSRemote;
 }
 
 function deduplicate(jobs: Job[]) {
   const seen = new Set<string>();
 
   return jobs.filter((job) => {
-    const url = (job.url || "")
-      .toLowerCase()
-      .split("?")[0]
-      .replace(/\/+$/, "");
+    const normalize = (value: string) =>
+      value.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-    const identity = [
-      job.company.toLowerCase().replace(/[^a-z0-9]/g, ""),
-      job.title.toLowerCase().replace(/[^a-z0-9]/g, ""),
-      url,
-    ].join("|");
+    const identity =
+      `${normalize(job.company)}|${normalize(job.title)}`;
 
     if (seen.has(identity)) return false;
+
     seen.add(identity);
     return true;
   });
@@ -109,7 +115,10 @@ async function getGreenhouseJobs(boards: string[]): Promise<Job[]> {
     [...new Set(boards)].map(async (board) => {
       const response = await fetch(
         `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(board)}/jobs?content=true`,
-        { cache: "no-store", signal: AbortSignal.timeout(12000) }
+        {
+          cache: "no-store",
+          signal: AbortSignal.timeout(12000),
+        }
       );
 
       if (!response.ok) throw new Error("Board unavailable");
@@ -120,12 +129,12 @@ async function getGreenhouseJobs(boards: string[]): Promise<Job[]> {
         id: `gh:${board}:${job.id}`,
         company: labels[board.toLowerCase()] || board,
         title: job.title || "Untitled role",
-        location: job.location?.name || "Location not provided",
+        location: job.location?.name || "",
         url: job.absolute_url || "",
         description: plain(job.content || "").slice(0, 7000),
         source: "Greenhouse",
-        // Greenhouse's public board response may not provide a posting date.
-      }));
+        created: job.updated_at || job.created_at || undefined,
+      } satisfies Job));
     })
   );
 
@@ -134,7 +143,10 @@ async function getGreenhouseJobs(boards: string[]): Promise<Job[]> {
   );
 }
 
-async function getAdzunaJobs(query: string, page: number): Promise<Job[]> {
+async function getAdzunaJobs(
+  query: string,
+  page: number
+): Promise<Job[]> {
   const appId = process.env.ADZUNA_APP_ID;
   const appKey = process.env.ADZUNA_APP_KEY;
 
@@ -153,7 +165,10 @@ async function getAdzunaJobs(query: string, page: number): Promise<Job[]> {
 
   const response = await fetch(
     `https://api.adzuna.com/v1/api/jobs/us/search/${page}?${params}`,
-    { cache: "no-store", signal: AbortSignal.timeout(15000) }
+    {
+      cache: "no-store",
+      signal: AbortSignal.timeout(15000),
+    }
   );
 
   if (!response.ok) {
@@ -174,7 +189,7 @@ async function getAdzunaJobs(query: string, page: number): Promise<Job[]> {
     created: job.created || undefined,
     salaryMin: job.salary_min ?? null,
     salaryMax: job.salary_max ?? null,
-  }));
+  } satisfies Job));
 }
 
 export async function POST(req: Request) {
@@ -189,7 +204,9 @@ export async function POST(req: Request) {
       .slice(0, 40);
 
     const query =
-      typeof body.query === "string" ? body.query.trim().slice(0, 120) : "";
+      typeof body.query === "string"
+        ? body.query.trim().slice(0, 120)
+        : "";
 
     const page = Math.min(
       5,
@@ -207,38 +224,36 @@ export async function POST(req: Request) {
     const combined = [...greenhouse, ...adzuna];
 
     const filtered = combined.filter((job) => {
-      if (!job.location || job.location === "Location not provided") {
-        return false;
-      }
-
+      if (!job.location || !job.url) return false;
       if (!isUSJob(job)) return false;
+      if (!isRecent(job)) return false;
 
-      if (job.source === "Adzuna" && job.created) {
-        const posted = new Date(job.created).getTime();
-        const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-
-        if (!Number.isFinite(posted) || posted < sevenDaysAgo) {
-          return false;
-        }
-      }
-
-      return Boolean(job.url);
+      return true;
     });
 
     const jobs = deduplicate(filtered).sort((a, b) => {
-      const aDate = a.created ? new Date(a.created).getTime() : 0;
-      const bDate = b.created ? new Date(b.created).getTime() : 0;
-      return bDate - aDate;
+      return (
+        new Date(b.created!).getTime() -
+        new Date(a.created!).getTime()
+      );
     });
 
-    return NextResponse.json({
-      jobs,
-      warning: jobs.length
-        ? `Showing ${jobs.length} unique US listings. Adzuna listings are limited to the last 7 days; Greenhouse posting dates may be unavailable.`
-        : "No matching US listings found. Try another keyword or check the company boards.",
-    });
+    return NextResponse.json(
+      {
+        jobs,
+        warning: jobs.length
+          ? `Showing ${jobs.length} deduplicated US listings with dates from the last 7 days. Some new jobs may be excluded if their source does not provide a date.`
+          : "No recently dated US listings found. Try a different keyword or search again later.",
+      },
+      {
+        headers: {
+          "Cache-Control": "no-store, max-age=0",
+        },
+      }
+    );
   } catch (error) {
     console.error("Job search failed:", error);
+
     return NextResponse.json(
       { error: "Job search failed. Check connection and retry." },
       { status: 500 }
